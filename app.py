@@ -1,121 +1,153 @@
-# Import necessary libraries from Flask
 from flask import Flask, request, jsonify
-# Import database and models for Client and HealthProgram
-from models import db, Client, HealthProgram
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from dotenv import load_dotenv
+from functools import wraps
+import os
 
-# Initialize the Flask app
+load_dotenv()
+
 app = Flask(__name__)
 
-# Configure the app to use a SQLite database
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///health_info_system.db'  # Database URI
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Disable track modifications to save resources
-
-# Initialize the database with the app
-db.init_app(app)
-
-# Route for the home page
-@app.route('/')
-def home():
-    return "Welcome to the Health Information System!"  # Simple welcome message
-
-# Endpoint to create a new health program
-@app.route('/programs', methods=['POST'])
-def create_program():
-    # Get data from the request body in JSON format
-    data = request.get_json()
-    
-    # Create a new health program with the provided name
-    new_program = HealthProgram(name=data['name'])
-    
-    # Add the new program to the database session
-    db.session.add(new_program)
-    
-    # Commit the changes to the database (save the new program)
-    db.session.commit()
-    
-    # Return a success message with HTTP status 201 (Created)
-    return jsonify({'message': 'Health program created successfully'}), 201
-
-# Endpoint to register a new client
-@app.route('/clients', methods=['POST'])
-def register_client():
-    # Get data from the request body in JSON format
-    data = request.get_json()
-    
-    # Create a new client with the provided name and email
-    new_client = Client(name=data['name'], email=data['email'])
-    
-    # Add the new client to the database session
-    db.session.add(new_client)
-    
-    # Commit the changes to the database (save the new client)
-    db.session.commit()
-    
-    # Return a success message with HTTP status 201 (Created)
-    return jsonify({'message': 'Client registered successfully'}), 201
-
-# Endpoint to enroll a client in health programs
-@app.route('/enroll', methods=['POST'])
-def enroll_client():
-    # Get data from the request body in JSON format
-    data = request.get_json()
-    
-    # Find the client by email (assuming email is unique)
-    client = Client.query.filter_by(email=data['email']).first()
-    
-    # If client is not found, return an error message
-    if not client:
-        return jsonify({'message': 'Client not found'}), 404
-    
-    # Loop through the list of program names to enroll the client
-    for program_name in data['programs']:
-        # Find the program by name
-        program = HealthProgram.query.filter_by(name=program_name).first()
-        
-        # If program exists and the client is not already enrolled in it, enroll the client
-        if program and program not in client.programs:
-            client.programs.append(program)
-    
-    # Commit the changes to the database (save the enrollments)
-    db.session.commit()
-    
-    # Return a success message with HTTP status 200 (OK)
-    return jsonify({'message': 'Client enrolled in programs successfully'}), 200
-
-# Endpoint to search for clients by name or email
-@app.route('/clients/search', methods=['GET'])
-def search_client():
-    # Get the query parameter from the URL
-    query = request.args.get('query')
-    
-    # Search for clients where the name or email contains the query string
-    clients = Client.query.filter((Client.name.contains(query)) | (Client.email.contains(query))).all()
-    
-    # Return the list of found clients as a JSON response
-    return jsonify([{'name': client.name, 'email': client.email} for client in clients]), 200
-
-# Endpoint to view a specific client's profile by client ID
-@app.route('/clients/<int:client_id>', methods=['GET'])
-def view_client_profile(client_id):
-    # Get the client by ID
-    client = Client.query.get(client_id)
-    
-    # If the client is not found, return an error message
-    if not client:
-        return jsonify({'message': 'Client not found'}), 404
-    
-    # Prepare the client's profile data, including the programs they are enrolled in
-    client_data = {
-        'name': client.name,
-        'email': client.email,
-        'programs': [program.name for program in client.programs]  # List of program names the client is enrolled in
+# Enhanced CORS Configuration
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:8000"],
+        "methods": ["GET", "POST", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "X-API-KEY"],
+        "supports_credentials": True
     }
-    
-    # Return the client's profile data as a JSON response
-    return jsonify(client_data), 200
+})
 
-# Initialize the database and start the Flask app when the script is run
+# Rate limiter
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    storage_uri=os.environ.get('REDIS_URL', 'memory://'),
+    default_limits=["200 per day", "50 per hour"]
+)
+
+# Database configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///health_info.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['API_KEYS'] = os.environ.get('API_KEYS', '').split(',')
+
+db = SQLAlchemy(app)
+
+# Models
+class HealthProgram(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+
+class Client(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    programs = db.relationship('HealthProgram', secondary='client_program')
+
+client_program = db.Table('client_program',
+    db.Column('client_id', db.Integer, db.ForeignKey('client.id')),
+    db.Column('program_id', db.Integer, db.ForeignKey('health_program.id'))
+)
+
+# Decorators
+def require_api_key(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        api_key = request.headers.get('X-API-KEY')
+        if api_key not in app.config['API_KEYS']:
+            return jsonify({"error": "Unauthorized"}), 401
+        return func(*args, **kwargs)
+    return wrapper
+
+# Routes
+@app.route('/api/programs', methods=['GET', 'POST'])
+@require_api_key
+def handle_programs():
+    if request.method == 'POST':
+        data = request.get_json()
+        if not data or not data.get('name'):
+            return jsonify({"error": "Program name required"}), 400
+        
+        if HealthProgram.query.filter_by(name=data['name']).first():
+            return jsonify({"error": "Program already exists"}), 409
+            
+        program = HealthProgram(name=data['name'])
+        db.session.add(program)
+        db.session.commit()
+        return jsonify({"id": program.id, "name": program.name}), 201
+    else:
+        programs = HealthProgram.query.all()
+        return jsonify([{"id": p.id, "name": p.name} for p in programs])
+
+@app.route('/api/programs/<int:program_id>', methods=['DELETE'])
+@require_api_key
+def delete_program(program_id):
+    program = HealthProgram.query.get_or_404(program_id)
+    db.session.delete(program)
+    db.session.commit()
+    return jsonify({"message": "Program deleted"}), 200
+
+@app.route('/api/clients', methods=['GET', 'POST'])
+@limiter.limit("10 per minute")
+@require_api_key
+def handle_clients():
+    if request.method == 'POST':
+        data = request.get_json()
+        if not data or not data.get('name') or not data.get('email'):
+            return jsonify({"error": "Name and email are required"}), 400
+
+        if Client.query.filter_by(email=data['email']).first():
+            return jsonify({"error": "Client already exists"}), 409
+
+        client = Client(name=data['name'], email=data['email'])
+        
+        program_ids = data.get('programs', [])
+        for pid in program_ids:
+            program = HealthProgram.query.get(pid)
+            if program:
+                client.programs.append(program)
+        
+        db.session.add(client)
+        db.session.commit()
+        return jsonify({
+            "id": client.id,
+            "name": client.name,
+            "email": client.email,
+            "programs": [{"id": p.id, "name": p.name} for p in client.programs]
+        }), 201
+    else:
+        clients = Client.query.all()
+        return jsonify([{
+            "id": c.id,
+            "name": c.name,
+            "email": c.email,
+            "programs": [{"id": p.id, "name": p.name} for p in c.programs]
+        } for c in clients])
+
+@app.route('/api/clients/<int:client_id>', methods=['DELETE'])
+@require_api_key
+def delete_client(client_id):
+    client = Client.query.get_or_404(client_id)
+    db.session.delete(client)
+    db.session.commit()
+    return jsonify({"message": "Client deleted"}), 200
+
+@app.route('/api/clients/search', methods=['GET'])
+@require_api_key
+def search_clients():
+    query = request.args.get('query', '')
+    clients = Client.query.filter(Client.name.ilike(f'%{query}%')).all()
+    return jsonify([{
+        "id": c.id,
+        "name": c.name,
+        "email": c.email,
+        "programs": [{"id": p.id, "name": p.name} for p in c.programs]
+    } for c in clients])
+
 if __name__ == '__main__':
     with app.app_context():
-        db.create_all()  # Create the database tables if they do not exist
-    app.run(debug=True)  # Run the Flask app in debug mode for development
+        db.create_all()
+    app.run(host='0.0.0.0', port=5000, debug=True)
